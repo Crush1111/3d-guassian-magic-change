@@ -1,0 +1,4 @@
+# ninja log v5
+0	15494	1692084404	/home/guozebin/work_code/3d_gaussian_magic_change/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/simple_knn.o	a10dc6ae304423a2
+0	21356	1692084410	/home/guozebin/work_code/3d_gaussian_magic_change/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/ext.o	a697f4aad633a404
+1	52891	1692084442	/home/guozebin/work_code/3d_gaussian_magic_change/submodules/simple-knn/build/temp.linux-x86_64-cpython-37/spatial.o	75cf0ba7453e9141
