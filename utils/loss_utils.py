@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
-def compute_rank_loss(dyn_depth, gt_depth, lambda_depth, sample_nums=1000):
+def compute_rank_loss(dyn_depth, gt_depth, lambda_depth, sample_nums=100):
     """
     rank loss 不关心2d位置，只关心前后关系
     dyn_depth：nerf渲染视差

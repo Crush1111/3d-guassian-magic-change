@@ -10,11 +10,15 @@
 #
 from scene.cameras import Camera
 import torch
+import os
+from utils.system_utils import mkdir_p
 import torch.nn as nn
+# import tinycudann as tcnn
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.system_utils import searchForMaxIteration
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -105,8 +109,98 @@ class CameraOptimizer(nn.Module):
         viewpoint_cam.camera_center = viewpoint_cam.world_view_transform.inverse()[3, :3]
         return viewpoint_cam
 
+class AppearanceOptimizer(nn.Module):
+    def __init__(
+        self,
+        num_cameras,
+        device='cuda',
+    ):
+        super().__init__()
+        self.num_cameras = num_cameras
+        self.device = device
+        print('using appearance embedding!')
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, bbox_mask=None):
+        # Initialize learnable parameters.
+        self.appearance_emb = torch.nn.Parameter(torch.zeros((num_cameras, 1, 16), device=device))
+
+        self.appearance_embedding_config = {
+            "n_input_dims": 32,
+            "n_output_dims": 3,
+            "encoding_config": {
+                "otype": "Frequency",
+                "n_frequencies": 4
+            },
+            "network_config": {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "Sigmoid",
+                "n_neurons": 32,
+                "n_hidden_layers": 2
+            },
+            "seed": 1337,
+        }
+
+        self.init_appearance_embedding_model()
+        self.appearance_embedding.to(device)
+
+        l = [
+            {'params': [self.appearance_emb], 'lr': 0.0001, "name": "appearance_emb"},
+            {'params': list(self.appearance_embedding.parameters()), 'lr': 0.0001, "name": "appearance_embedding"},
+        ]
+
+        self.appearance_embedding_optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+    def init_appearance_embedding_model(self):
+        if self.appearance_embedding_config is not None:
+            self.appearance_embedding = tcnn.NetworkWithInputEncoding(**self.appearance_embedding_config)
+
+    def forward(self, viewpoint_cam):
+        ## 将viewmats作为位置编码
+        emb = torch.cat([self.appearance_emb[viewpoint_cam.uid], viewpoint_cam.world_view_transform.reshape(1, -1)], -1)
+        appearance_factors = self.appearance_embedding(emb).reshape((-1, 1, 1))
+        return appearance_factors
+
+    def save_appearance_embedding(self, path):
+        if self.appearance_embedding is not None:
+            mkdir_p(os.path.dirname(path))
+            torch.save({
+                "model_config": self.appearance_embedding_config,
+                "model_state_dict": self.appearance_embedding.state_dict(),
+                "appearance_emb_state_dict": self.appearance_emb,
+            }, path)
+
+    def load_appearance_embedding(self, model_path, load_iteration=None):
+
+        if load_iteration:
+            if load_iteration == -1:
+                loaded_iter = searchForMaxIteration(os.path.join(model_path, "point_cloud"))
+            else:
+                loaded_iter = load_iteration
+            print("Loading trained appearance embedding model at iteration {}".format(loaded_iter))
+
+        path = os.path.join(model_path,
+                          "point_cloud",
+                          "iteration_" + str(loaded_iter),
+                          "appearance_embedding.ckpt")
+
+        if os.path.exists(path):
+            checkpoint = torch.load(path)
+            # load config
+            self.appearance_embedding_config = checkpoint["model_config"]
+            # init model based on config
+            self.init_appearance_embedding_model()
+            # load model state dict
+            self.appearance_embedding.load_state_dict(checkpoint["model_state_dict"])
+            self.appearance_emb.load_state_dict(checkpoint["appearance_emb_state_dict"])
+            self.appearance_embedding.to(self.device)
+            self.appearance_emb.to(self.device)
+        else:
+            print("disable appearance embedding")
+            self.appearance_embedding = None
+
+
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, bbox_mask=None, rgb_factors=None):
     """
     Render the scene.
 
@@ -175,7 +269,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             colors_precomp = override_color
 
         # Rasterize visible Gaussians to image, obtain their radii (on screen).
-        rendered_image, radii, depth = rasterizer(
+        rendered_image, radii, depth, alpha = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -186,13 +280,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
 
         depth = depth / (depth.max() + 1e-5)
+
+        # Appearance embedding
+        if rgb_factors is not None:
+            rendered_image = rendered_image * rgb_factors
+        else:
+            rendered_image = rendered_image
+
         # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
         # They will be excluded from value updates used in the splitting criteria.
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
-                "depth": depth}
+                "depth": depth,
+                "alpha": alpha}
 
     else:
         # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -255,21 +357,29 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             colors_precomp = override_color
 
         # Rasterize visible Gaussians to image, obtain their radii (on screen).
-        rendered_image, radii, depth = rasterizer(
+        rendered_image, radii, depth, alpha = rasterizer(
             means3D=means3D,
             means2D=means2D,
+            opacities=opacity,
             shs=shs,
             colors_precomp=colors_precomp,
-            opacities=opacity,
             scales=scales,
             rotations=rotations,
             cov3D_precomp=cov3D_precomp)
 
         depth = depth / (depth.max() + 1e-5)
+
+        # Appearance embedding
+        if rgb_factors is not None:
+            rendered_image = rendered_image * rgb_factors
+        else:
+            rendered_image = rendered_image
+
         # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
         # They will be excluded from value updates used in the splitting criteria.
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter": radii > 0,
                 "radii": radii,
-                "depth": depth}
+                "depth": depth,
+                "alpha": alpha}

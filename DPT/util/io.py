@@ -191,7 +191,7 @@ def write_depth(path, depth, bits=1, absolute_depth=False):
             out = np.zeros(depth.shape, dtype=depth.dtype)
 
     if bits == 1:
-        cv2.imwrite(path + ".jpg", out.astype("uint8"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
+        cv2.imwrite(path + ".png", out.astype("uint8"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
     elif bits == 2:
         cv2.imwrite(path + ".png", out.astype("uint16"), [cv2.IMWRITE_PNG_COMPRESSION, 0])
 

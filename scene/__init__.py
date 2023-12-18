@@ -21,7 +21,6 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from dataclasses import dataclass
-from utils.system_utils import mkdir_p
 
 class Scene:
 
@@ -61,8 +60,12 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, using_depth=args.using_depth)
         # 尝试下其他数据，比如slam转nerfstudio
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
-            print("Found transforms_train.json file, assuming NeRFstudio data set!")
+            print("Found transforms.json file, assuming NeRFstudio data set!")
             scene_info = sceneLoadTypeCallbacks["NeRFstudio"](args.source_path, args.eval, using_depth=args.using_depth)
+
+        elif os.path.exists(os.path.join(args.source_path, "transforms_polycam.json")):
+            print("Found transforms_polycam.json file, assuming Polycam data set!")
+            scene_info = sceneLoadTypeCallbacks["Polycam"](args.source_path, args.eval, using_depth=args.using_depth)            
         else:
             assert False, "Could not recognize scene type!"
 
@@ -90,10 +93,10 @@ class Scene:
             # 在此处添加一个控制，如果low_memory=True,那么训练测试的字典中相机个数都只取一个
             if low_memory:
                 print("Loading Cameras in low_memory mode")
-                self.train_cameras[resolution_scale] = cameraList_from_camInfos([scene_info.train_cameras[0]],
-                                                                                resolution_scale, args)
-                self.test_cameras[resolution_scale] = cameraList_from_camInfos([scene_info.test_cameras[0]],
-                                                                               resolution_scale, args)
+                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras,
+                                                                                resolution_scale, args, low_memory=low_memory)
+                # self.test_cameras[resolution_scale] = cameraList_from_camInfos([scene_info.test_cameras[0]],
+                #                                                                resolution_scale, args)
             else:
                 print("Loading Training Cameras")
                 self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)

@@ -21,7 +21,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from visual_res_app.camera_trajectory import *
-from composite_video import  save_vidio
+from composite_video import  save_vidio, save_vidio_no_depth
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -92,16 +92,19 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         if render_file:
             render_from_file(dataset.model_path, "freedom", scene.loaded_iter, gaussians, pipeline, background)
-            save_vidio(dataset.model_path, "freedom", scene.loaded_iter)
+            save_vidio_no_depth(dataset.model_path, "freedom", scene.loaded_iter)
         if inter_test_frames:
              render_inter(dataset.model_path, "interpolation", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
-             save_vidio(dataset.model_path, "interpolation", scene.loaded_iter)
+             save_vidio_no_depth(dataset.model_path, "interpolation", scene.loaded_iter)
 
         if train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+             save_vidio_no_depth(dataset.model_path, "train", scene.loaded_iter)
 
         if test:
              render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+             save_vidio_no_depth(dataset.model_path, "test", scene.loaded_iter)
+
 
 
 if __name__ == "__main__":

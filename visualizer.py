@@ -1,5 +1,5 @@
 import cv2
-
+from e3nn import o3
 from argparse import ArgumentParser
 
 from utils.graphics_utils import fov2focal
@@ -13,7 +13,8 @@ import numpy as np
 from dataclasses import dataclass
 import math
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+from datetime import datetime
+os.environ["CUDA_VISIBLE_DEVICES"] = '3'
 
 
 
@@ -60,6 +61,7 @@ class Render:
 
     def __init__(self, dataset, iteration, pipeline, sub_scene=None, fast_gui=False, low_memory=False):
         self.gaussians, self.scene, self.background = self.render_init(dataset, iteration, sub_scene, low_memory)
+        print('total nums:', self.scene.gaussians.get_xyz.shape[0])
         self.pipeline = pipeline
         self.all_view = self.scene.getTrainCameras()
         self.view = self.scene.getTrainCameras()[0]
@@ -136,7 +138,16 @@ class Render:
         self.keyframes_num = self.gui.label('keyframes')
         self.keyframes_num.value = 0
         self.keyframes = []
-
+        # 添加相机范围限制
+        # 移动范围-自行选择范围
+        self.outbounding_sign = False
+        self.cam_limit = False
+        self.cam_pan_bbox = None
+        self.cam_pan_bbox_base = None
+        self.plot_cam_mode = {
+            'cam': self.all_view,
+            'keyframes': self.keyframes,
+        }
     def render_init(self, dataset, iteration, sub_scene=None, low_memory=False):
         with torch.no_grad():
             gaussians = GaussianModel(dataset.sh_degree)
@@ -234,7 +245,6 @@ class Render:
         # 跨越子场景： 跟上述逻辑相同，但是需要考虑场景删除，跨越的场景将被删除，对应后续场景的索引递减
         """
 
-
         # 1. 获取场景起始数组
         start_end_array = []
         for key in self.extra_scene_info_dict.keys():
@@ -280,8 +290,8 @@ class Render:
             if object_selected:
                 start_offset = self.extra_scene_info_dict[self.selected_scene].start_offset
                 end_offset = self.extra_scene_info_dict[self.selected_scene].end_offset
-                # if not self.clip:
-                #     self.mouse_control_pcd(start_offset, end_offset)
+                if not self.clip:
+                    self.mouse_control_pcd(start_offset, end_offset)
 
             for event in events:
 
@@ -304,7 +314,22 @@ class Render:
                         #  更新中心点
                         self.extra_scene_info_dict[self.selected_scene].center = self.gaussians.get_xyz.data[start_offset:end_offset].mean(0).cpu().numpy()
                     else:
-                        self.view = self.key_dict_cam[event.key](self.view)
+                        # BUG: 行为与预想完全不一致
+                        # 需要在这里判断self.view是否在ROT区域
+                        # camera_center表示c2w矩阵的T，self.cam_pan_bbox 2x3, 表示bbox在自身坐标系下的self.cam_pan_bbox表示将bbox转换到以自身的一个角点为原点的一组正交基， 将cam_center转换到bbox坐标系下后就可以通过
+                        # cam_center_base > self.cam_pan_bbox[0], cam_center_base < self.cam_pan_bbox[1]来判断是否被bbox包含了
+                        if self.cam_pan_bbox is not None and event.key in ['w', 'a', 's', 'd', 'q', 'e']:
+                            next_view = self.key_dict_cam[event.key](self.view)
+                            cam_center = next_view.camera_center
+                            cam_center_base = cam_center @ self.cam_pan_bbox_base
+                            if torch.all(torch.cat([cam_center_base > self.cam_pan_bbox[0], cam_center_base < self.cam_pan_bbox[1]], -1), -1).item():
+                                # print('in bbox')
+                                self.outbounding_sign = False
+                                self.view = next_view
+                            else:
+                                self.outbounding_sign = True
+                        else:
+                            self.view = self.key_dict_cam[event.key](self.view)
 
                 elif  event.key == 'm':
                     self.trans_mode()
@@ -381,6 +406,30 @@ class Render:
                             torchImage2tiImage(self.image_buffer, image)
                             self.gui.set_image(self.image_buffer)
                             self.gui.show()
+
+                    except:
+                        print("keyframes number must > 2")
+
+                if event.key == 'f':
+                    self.cam_limit_mode()
+
+                # 添加直接保存的功能
+                elif event.key == 'y':
+                    try:
+                        views = inter_poses(self.keyframes, 300, save_path=self.render_path)
+                        current_datetime = datetime.now()
+                        video_path = f'{self.render_path}/freedom_view_{current_datetime.strftime("%Y-%m-%d-%H-%M-%S")}.mp4'
+                        count = 0
+                        # 保存一下文件，然后离线渲染视频
+                        for view in tqdm(views, desc="render video"):
+                            count += 1
+                            im = self.render_single(view, self.gaussians, self.pipeline, self.background, bbox_mask=self.mask)
+                            img = (im[:, :, ::-1] * 255).clip(0, 255).astype(np.uint8)
+                            if count == 1:
+                                fps, w, h = 30, img.shape[1], img.shape[0]
+                                out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                            out.write(img)
+                        print('Done!')
                     except:
                         print("keyframes number must > 2")
 
@@ -392,18 +441,34 @@ class Render:
 
 
             if self.clip:
-                self.bbox_clip(start_offset, end_offset) # 包含clip + bbox旋转
-
+                comp_l, comp_m, base = self.bbox_clip(start_offset, end_offset) # 包含clip + bbox旋转
+                if self.cam_limit:
+                    # 计算limit
+                    self.cam_pan_bbox = torch.vstack([comp_l.clone(), comp_m.clone()])
+                    self.cam_pan_bbox_base = base.clone()
+                    # print(self.cam_pan_bbox, self.cam_pan_bbox_base)
+                    # trans cam center
+                    self.view = trans_cam_center_to_bbox_center(self.view, self.cam_pan_bbox, self.cam_pan_bbox_base)
+                    print("相机约束完成")
+                    self.cam_limit = False
             else:
                 # 关闭该模式则不使用mask
                 self.mask = None
                 self.mouse_control()
 
+
             image = self.render_single(self.view, self.gaussians, self.pipeline, self.background, bbox_mask=self.mask)
 
             if self.mode == 'render':
-                if self.clip and self.projected_2d is not None:
+                # 越界警告！
+                if self.outbounding_sign:
+                    self.warning_projected(image)
+
+                if self.clip and self.projected_2d in ['bbox', 'xyz']:
                     self.bbox_projected(image)
+
+                if self.projected_2d in ['cam', 'keyframes']:
+                    self.cam_projected(image)
 
                 if self.projected_sub_scene:
                     self.sub_scene_projected(image)
@@ -422,6 +487,14 @@ class Render:
 
             cv2.line(image, tuple(start), tuple(end), color=line_color, thickness=1)
 
+    def cam_projected(self, image, line_color = (255, 255, 0)):
+        # 投影画图
+        begin, end = self.projected()        # 画线
+        # 遍历每一条线段，绘制到图像上
+        for start, end in zip(begin, end):
+
+            cv2.line(image, tuple(start), tuple(end), color=line_color, thickness=1)
+
     def sub_scene_projected(self, image, font = cv2.FONT_HERSHEY_SIMPLEX, font_size = 0.5, font_color = (255, 255, 0)):
         try:
             sub_scene_center = torch.stack([torch.tensor(self.extra_scene_info_dict[i].center) for i in range(len(self.extra_scene_info_dict))])
@@ -431,14 +504,7 @@ class Render:
         if sub_scene_center is None:
             return
         # 投影画图
-        focal_length_x = fov2focal(self.view.FoVx, self.view.image_width)
-        focal_length_y = fov2focal(self.view.FoVy, self.view.image_height)
-        # c2img
-        K = torch.tensor([
-            [focal_length_x, 0, self.view.image_width / 2],
-            [0, focal_length_y, self.view.image_height / 2],
-            [0, 0, 1]
-        ]).to(self.comp_l.device)
+        K = self.view.K
         # w2c
         P = self.view.world_view_transform.T
         # 旋转之后不在满足
@@ -457,15 +523,38 @@ class Render:
                 x, y = sub
                 cv2.putText(image, str(text), (x, y), font, font_size, font_color, thickness=2)
 
+    def warning_projected(self, image, font = cv2.FONT_HERSHEY_SIMPLEX, font_size = 0.5, font_color = (255, 0, 0)):
+        x, y = 0, 20
+        cv2.putText(image, "Warning, reach the scene boundary!", (x, y), font, font_size, font_color, thickness=1)
+
+    @staticmethod
+    def world_to_image_projected(homogeneous_pcd, P, K):
+        """
+        return 
+        """
+        # 计算投影坐标
+        point_cloud_camera = torch.matmul(P, homogeneous_pcd.t()).t()
+        # print(point_cloud_camera.shape)
+        # print(point_cloud_camera)
+        # 使用深度进行过滤
+        mask = (point_cloud_camera[0, -2] >= 0)
+        # print(mask)
+        # Project points onto the image plane
+        points_projected = torch.matmul(K, point_cloud_camera[:, :3].t()).t()
+        projected_image = (points_projected[:, :2] / points_projected[:, 2:3]).cpu().numpy().astype(np.int32)
+
+        return projected_image, mask
+
     def projected(self):
-        focal_length_x = fov2focal(self.view.FoVx, self.view.image_width)
-        focal_length_y = fov2focal(self.view.FoVy, self.view.image_height)
-        # c2img
-        K = torch.tensor([
-            [focal_length_x, 0, self.view.image_width / 2],
-            [0, focal_length_y, self.view.image_height / 2],
-            [0, 0, 1]
-        ]).to(self.comp_l.device)
+        # focal_length_x = fov2focal(self.view.FoVx, self.view.image_width)
+        # focal_length_y = fov2focal(self.view.FoVy, self.view.image_height)
+        # # c2img
+        # K = torch.tensor([
+        #     [focal_length_x, 0, self.view.image_width / 2],
+        #     [0, focal_length_y, self.view.image_height / 2],
+        #     [0, 0, 1]
+        # ]).to(self.comp_l.device)
+        K = self.view.K
         # w2c
         P = self.view.world_view_transform.T
         # 旋转之后不在满足
@@ -473,23 +562,8 @@ class Render:
         # 3d点需要满足的条件是，对于连线的两个3d点，有两个坐标是相同的
         if self.projected_2d == 'bbox':
             homogeneous_corners = torch.cat((self.corners, torch.ones(8, 1).to(self.comp_l.device)), dim=1)
-        elif self.projected_2d == 'xyz':
-            xyz = torch.tensor(
-                [[0, 0, 0],
-                 [1000, 0, 0],
-                 [0, 1000, 0],
-                 [0, 0, 1000]], dtype=torch.float
-            ).to(self.comp_l.device)
-            xyz = slider_con_bbox(xyz, self.x_r.value, self.y_r.value, self.z_r.value)
-            homogeneous_corners = torch.cat((xyz, torch.ones(4, 1).to(self.comp_l.device)), dim=1)
-
-        # 计算投影坐标
-        point_cloud_camera = torch.matmul(P, homogeneous_corners.t()).t()
-        # Project points onto the image plane
-        points_projected = torch.matmul(K, point_cloud_camera[:, :3].t()).t()
-        projected_corners = (points_projected[:, :2] / points_projected[:, 2:3]).cpu().numpy().astype(np.int32)
-
-        if self.projected_2d == 'bbox':
+            projected_coordinate, _ = self.world_to_image_projected(homogeneous_corners, P, K)
+            projected_coordinate = projected_coordinate[None]
             # 线的起点和终点索引对应关系
             line_indices = [
                 (0, 1), (0, 2), (0, 4),
@@ -497,24 +571,69 @@ class Render:
                 (2, 6), (3, 7), (4, 5),
                 (4, 6), (5, 7), (6, 7)
             ]
-        if self.projected_2d == 'xyz':
+
+        elif self.projected_2d == 'xyz':
+            xyz = torch.tensor(
+                [[0, 0, 0],
+                 [1000, 0, 0],
+                 [0, 1000, 0],
+                 [0, 0, 1000]], dtype=torch.float
+            ).to(self.comp_l.device)
+            xyz = center_r_bbox(xyz, self.x_r.value, self.y_r.value, self.z_r.value)
+            homogeneous_corners = torch.cat((xyz, torch.ones(4, 1).to(self.comp_l.device)), dim=1)
+            projected_coordinate, _ = self.world_to_image_projected(homogeneous_corners, P, K)
+            ######
             # 线的起点和终点索引对应关系
             line_indices = [(0, 1), (0, 2), (0, 3)]
             # 将原点移动到图像中心
             img_w, img_h = self.img_wh
             # 计算偏移量
-            shift = np.array([img_w / 2, img_h / 2], dtype=np.int32) - projected_corners[0]
-            projected_corners += shift
+            shift = np.array([img_w / 2, img_h / 2], dtype=np.int32) - projected_coordinate[0]
+            projected_coordinate += shift
+            projected_coordinate = projected_coordinate[None]
 
-        begins = []
-        ends = []
-        for begin_idx, end_idx in line_indices:
-            begin_point = projected_corners[begin_idx]
-            end_point = projected_corners[end_idx]
-            begins.append(begin_point)
-            ends.append(end_point)
-        begin = np.vstack(begins)
-        end = np.vstack(ends)
+        else:
+            # 与其他两种投影模式不同的是这里是多个cam
+            # 如何处理没有照相机的特殊情况
+            cam_list = []
+            mask_list = []
+            for cam in self.plot_cam_mode[self.projected_2d]:
+                cam_vis_3d = cam_vis(cam)
+                homogeneous_cam = torch.cat(
+                    (cam_vis_3d, torch.ones(cam_vis_3d.shape[0], 1).to(cam_vis_3d.device)), dim=1)
+                # # 使用自带的投影矩阵
+                # projected_cam = cam.projection_matrix @  homogeneous_cam
+                # projected_cam /= projected_cam[3, :3]
+            
+                projected_cam, mask = self.world_to_image_projected(homogeneous_cam, P, K)
+                cam_list.append(projected_cam[None])
+                mask_list.append(mask.cpu().numpy())
+            if len(cam_list):
+                projected_coordinate = np.concatenate(cam_list)
+                # # 过滤下 ：应该在3d空间过滤，判断相机是否在当前视角的视锥内部
+                mask = np.array(mask_list)
+                # print(mask)
+                projected_coordinate = projected_coordinate[mask]
+            else:
+                projected_coordinate = np.array([])
+            # print(projected_coordinate)
+            line_indices = [(0, 1), (0, 2), (0, 3), (0, 4),
+                            (1, 2), (2, 4), (4, 3), (3, 1)]
+
+        if  projected_coordinate.shape[0]:
+            begins = []
+            ends = []
+            for begin_idx, end_idx in line_indices:
+                for projected_object in projected_coordinate:
+                    begin_point = projected_object[begin_idx]
+                    end_point = projected_object[end_idx]
+                    begins.append(begin_point)
+                    ends.append(end_point)
+                begin = np.vstack(begins)
+                end = np.vstack(ends)
+        else:
+            begin = []
+            end = []
 
         return begin, end
 
@@ -528,6 +647,7 @@ class Render:
         # 定局部变量
         comp_l = self.comp_l.clone()
         comp_m = self.comp_m.clone()
+        # print('org空间', comp_l, comp_m)
         # 上面添加了缩放，下面添加旋转,以滑块的方式控制
         self.corners = torch.tensor(
             [[comp_l[0], comp_l[1], comp_l[2]],
@@ -541,7 +661,7 @@ class Render:
         ).to(self.comp_l.device)
         # print(self.corners)
         # 旋转坐标系
-        self.corners = slider_con_bbox(self.corners, self.x_r.value, self.y_r.value, self.z_r.value)
+        self.corners = center_r_bbox(self.corners, self.x_r.value, self.y_r.value, self.z_r.value)
         # 使用以bbox角点为原点，正交的三条边为基，来表示bbox
         dis = self.dis.clone()
         base = (torch.vstack([self.corners[1:3, :], self.corners[4]]) - self.corners[0]).flip(0)# 【z, y, x】 - [x, y, z]
@@ -570,6 +690,7 @@ class Render:
         pcd_selected = (base @ self.gaussians.get_xyz.data[start_offset:end_offset].T).T
         comp_l = self.corners.min(0).values
         comp_m = self.corners.max(0).values
+        # print('新空间', comp_l, comp_m)
         mask_sub = torch.all(torch.cat([pcd_selected > comp_l, pcd_selected < comp_m], -1), -1)
 
         # 转回原始空间
@@ -589,6 +710,8 @@ class Render:
         self.mask = torch.zeros(self.pcd_num, dtype=torch.bool).to(mask_sub.device)
         # 填充
         self.mask[start_offset:end_offset] = mask_sub
+
+        return  comp_l, comp_m, base
 
     def center_invariant_scaling(self, pcd, scale_factor):
         center = pcd.mean(0)
@@ -611,8 +734,11 @@ class Render:
                 angle_y = torch.tensor(dy * self.mouse_sensitivity)
                 # print(start_offset, end_offset)
                 self.gaussians.get_xyz.data[start_offset:end_offset] = \
-                    mouse_con_pcd(self.gaussians.get_xyz.data[start_offset:end_offset], angle_x, angle_y)
-                # 点云旋转，协方差要旋转吗？
+                    mouse_con_pcd(self.gaussians.get_xyz.data[start_offset:end_offset], angle_x, angle_y)            
+                # 需要旋转
+                # 点云旋转，sh需要旋转
+                self.gaussians._features_rest.data[start_offset:end_offset] = \
+                    mouse_con_pcd_sh(self.gaussians._features_rest.data[start_offset:end_offset], angle_x, angle_y)   
                 # self.gaussians.get_rotation.data[start_offset:end_offset] = \
                 #     mouse_con_quaternion(self.gaussians.get_rotation.data[start_offset:end_offset], angle_x, angle_y)
                 self.last_mouse_pos = mouse_pos
@@ -657,6 +783,11 @@ class Render:
         idx = mode.index(self.mode)
         self.mode = mode[(idx + 1) % 2]
 
+    def cam_limit_mode(self):
+        mode = [True, False]
+        idx = mode.index(self.cam_limit)
+        self.cam_limit = mode[(idx + 1) % 2]
+
     def clip_mode(self):
         mode = [True, False]
         idx = mode.index(self.clip)
@@ -668,9 +799,10 @@ class Render:
         self.rotate = mode[(idx + 1) % 2]
 
     def projected_mode(self):
-        mode = ['xyz', 'bbox', None]
+        mode = ['xyz', 'bbox', 'cam', 'keyframes', None]
         idx = mode.index(self.projected_2d)
-        self.projected_2d = mode[(idx + 1) % 3]
+        print("投影模式：", mode[(idx + 1) % 5])
+        self.projected_2d = mode[(idx + 1) % 5]
 
     def sub_scene_projected_mode(self):
         mode = [True, False]
@@ -700,15 +832,15 @@ if __name__ == '__main__':
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--sub_scene", default=[None], nargs='+', type=parse_sub_scene)
     parser.add_argument("--sub_scene_all", default=None, type=parse_sub_scene_all)
-    parser.add_argument("--fast_gui", default=False, type=parse_sub_fast_gui)
-    parser.add_argument("--low_memory", default=False, type=parse_sub_fast_gui)
+    parser.add_argument("--fast_gui", action="store_true")
+    parser.add_argument("--low_memory", action="store_true")
     args = get_combined_args(parser)
     print("Rendering: " + args.model_path)
     print("sub_scene_list: ", args.sub_scene)
     print("fast_gui ?  ",  args.fast_gui)
     print("low_memory ? ",  args.low_memory)
     # init
-    ti.init(arch=ti.cuda, device_memory_GB=4, kernel_profiler=True)
+    ti.init(arch=ti.cuda, device_memory_GB=1, kernel_profiler=True)
 
     if args.sub_scene_all is not None:
         render_ = Render(model.extract(args), args.iteration, pipeline, args.sub_scene_all, args.fast_gui, args.low_memory)

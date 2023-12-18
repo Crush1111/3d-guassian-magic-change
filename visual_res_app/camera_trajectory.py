@@ -6,10 +6,11 @@ from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 from tqdm import tqdm
 from datetime import datetime
+from e3nn import o3
 
 THETA = 5
 STEP = 0.1
-STEP_pcd = 0.05
+STEP_pcd = 0.01
 
 def rotate_n_z_axis(n=30):
     theta = torch.deg2rad(torch.tensor(n))
@@ -91,7 +92,7 @@ def turn_down(camera, theta=THETA):
 def turn_z_axis_l(camera, theta=THETA):
 
     R = rotate_n_horizontal_axis(n=theta)
-    transform_matrix = camera.world_view_transform.clone()
+    transform_matrix = camera.world_view_transform.clone().clone()
     transform_matrix[:, :3] = torch.bmm(R.to(transform_matrix.device).unsqueeze(0), transform_matrix.T[:3].unsqueeze(0)).squeeze(0).T
 
     world_view_transform = transform_matrix
@@ -103,7 +104,6 @@ def turn_z_axis_l(camera, theta=THETA):
     update_camera = MiniCam(camera.image_width, camera.image_height, camera.FoVy, camera.FoVx, camera.znear, camera.zfar, world_view_transform, full_proj_transform)
     return update_camera
 
-    return update_camera
 
 
 
@@ -122,10 +122,26 @@ def turn_z_axis_r(camera, theta=-THETA):
                             camera.zfar, world_view_transform, full_proj_transform)
     return update_camera
 
+def trans_cam_center_to_bbox_center(camera, bbox, base):
+    center = torch.mean(bbox, dim=0)
+    center_org = center @ base
+    inv_trans = torch.inverse(camera.world_view_transform)
+    inv_trans[3, :3] = center_org
+    transform_matrix = torch.inverse(inv_trans)
+
+    world_view_transform = transform_matrix
+    projection_matrix = getProjectionMatrix(znear=camera.znear, zfar=camera.zfar, fovX=camera.FoVx,
+                                            fovY=camera.FoVy).transpose(0, 1).cuda()
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))).squeeze(0)
+    update_camera = MiniCam(camera.image_width, camera.image_height, camera.FoVy, camera.FoVx, camera.znear,
+                            camera.zfar, world_view_transform, full_proj_transform)
+    return update_camera
+
 
 def go_forward(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 2] -= step
 
     world_view_transform = transform_matrix
@@ -139,7 +155,7 @@ def go_forward(camera, step=STEP):
 
 def go_backward(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 2] += step
 
     world_view_transform = transform_matrix
@@ -153,7 +169,7 @@ def go_backward(camera, step=STEP):
 
 def go_left(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 0] += step
 
     world_view_transform = transform_matrix
@@ -167,7 +183,7 @@ def go_left(camera, step=STEP):
 
 def go_right(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 0] -= step
 
     world_view_transform = transform_matrix
@@ -181,7 +197,7 @@ def go_right(camera, step=STEP):
 
 def go_up(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 1] += step
 
     world_view_transform = transform_matrix
@@ -195,7 +211,7 @@ def go_up(camera, step=STEP):
 
 def go_down(camera, step=STEP):
     # 计算w2c
-    transform_matrix = camera.world_view_transform
+    transform_matrix = camera.world_view_transform.clone()
     transform_matrix[-1, 1] -= step
 
     world_view_transform = transform_matrix
@@ -291,45 +307,43 @@ def mouse_con_pcd(pcd, angle_x, angle_y):
 
     return final_pcd
 
-def sort_box_vertices(box_vertices):
+def mouse_con_pcd_sh(sh, angle_x, angle_y):
+    # 构造绕Y轴的旋转矩阵
+    rotation_y = torch.tensor([
+        [torch.cos(angle_y), 0, -torch.sin(angle_y)],
+        [0, 1, 0],
+        [torch.sin(angle_y), 0, torch.cos(angle_y)]
+    ])
 
-    center = torch.mean(box_vertices, dim=0)
-    # 计算每个顶点相对于中心的向量
-    vectors = box_vertices - center
-    # 计算每个顶点的极角
-    angles = torch.atan2(vectors[:, 1], vectors[:, 0])
+    # 构造绕X轴的旋转矩阵
+    rotation_x = torch.tensor([
+        [1, 0, 0],
+        [0, torch.cos(angle_x), torch.sin(angle_x)],
+        [0, -torch.sin(angle_x), torch.cos(angle_x)]
+    ])
 
-    # 按极角排序
-    sorted_indices = torch.argsort(angles)
-    sorted_vertices = torch.index_select(box_vertices, 0, sorted_indices)
-
-    return sorted_vertices
-
-
-import torch
-
-def create_bbox_equations(bbox_vertices):
-    # 构建bbox的平面方程（法线和常数）
-    equations = []
-    for i in range(0, 8, 2):
-        p1 = bbox_vertices[i]
-        p2 = bbox_vertices[(i + 1) % 8]
-        normal = torch.cross(p1, p2)
-        d = -torch.dot(normal, p1)
-        equations.append((normal, d))
-    return equations
-
-def points_in_bbox(point_cloud, bbox_equations):
-    # 检查点是否在所有平面的同侧
-    points_inside_bbox = []
-    for point in point_cloud:
-        inside_bbox = all(torch.dot(normal, point) + d >= 0 for normal, d in bbox_equations)
-        points_inside_bbox.append(inside_bbox)
-    return torch.tensor(points_inside_bbox, dtype=torch.bool)
-
+    R = torch.mm(rotation_y, rotation_x)
+    # print(R)
+    rot_angles= o3._rotation.matrix_to_angles(R)
+    # print(rot_angles)
+    # 构造系数
+    D_1 = o3.wigner_D(1, rot_angles[0], rot_angles[1], rot_angles[2])
+    D_2 = o3.wigner_D(2, rot_angles[0], rot_angles[1], rot_angles[2])
+    D_3 = o3.wigner_D(3, rot_angles[0], rot_angles[1], rot_angles[2])
+    
+    # 
+    sh[:, 0:3, :] = torch.matmul(D_1.to(sh.device), sh[:, 0:3, :])
+    sh[:, 3:8, :] = torch.matmul(D_2.to(sh.device), sh[:, 3:8, :])
+    sh[:, 8:15, :] = torch.matmul(D_3.to(sh.device), sh[:, 8:15, :])
+    sh[:] = 0
+    print(sh)
+    print(sh.shape)
+    return sh
 
 def slider_con_bbox(pcd, angle_x_, angle_y_, angle_z_):
     # 计算点云的中心坐标
+    T = pcd.mean(0)
+    center_pcd = pcd - T
     # 将点云中的每个点减去中心坐标
     angle_x, angle_y, angle_z = torch.deg2rad(torch.tensor(angle_x_)), \
                                 torch.deg2rad(torch.tensor(angle_y_)), torch.deg2rad(torch.tensor(angle_z_))
@@ -355,16 +369,20 @@ def slider_con_bbox(pcd, angle_x_, angle_y_, angle_z_):
     R  = torch.mm(rotation_z, torch.mm(rotation_y, rotation_x))
     # 计算投影坐标
     # 将旋转矩阵应用到点云上
-    rotated_pcd = torch.mm(R.to(pcd.device), pcd.T).T
+    rotated_pcd = torch.mm(R.to(pcd.device), center_pcd.T).T
     # 将旋转后的点云的每个点加上中心坐标
-    final_pcd = rotated_pcd
+    final_pcd = rotated_pcd + T
 
     return final_pcd
 
 def center_r_bbox(pcd, angle_x_, angle_y_, angle_z_):
-    # 计算点云的中心坐标
-    center = pcd.mean(0)
-    centered_pcd = pcd - center
+    """
+    先计算bbox坐标系下绕bbox中心的旋转
+    然后将该旋转转换到世界坐标系的表示
+    bbox 坐标系： 与世界坐标系就相差一个T
+    用世界坐标系表示这个函数
+    """
+
     # 将点云中的每个点减去中心坐标
     angle_x, angle_y, angle_z = torch.deg2rad(torch.tensor(angle_x_)), \
                                 torch.deg2rad(torch.tensor(angle_y_)), torch.deg2rad(torch.tensor(angle_z_))
@@ -387,14 +405,10 @@ def center_r_bbox(pcd, angle_x_, angle_y_, angle_z_):
         [0, 0, 1]
     ])
 
-    R  = torch.mm(rotation_z, torch.mm(rotation_y, rotation_x))
-    # 计算投影坐标
-    # 将旋转矩阵应用到点云上
-    rotated_pcd = torch.mm(R.to(pcd.device), centered_pcd.T).T
-    # 将旋转后的点云的每个点加上中心坐标
-    final_pcd = rotated_pcd + center
+    R = torch.mm(rotation_z, torch.mm(rotation_y, rotation_x))
+    rotated_pcd = torch.mm(R.to(pcd.device), pcd.T).T
 
-    return final_pcd
+    return rotated_pcd
 
 def slider_con_bbox_inv(pcd, angle_x_, angle_y_, angle_z_):
     # 计算点云的中心坐标
@@ -594,5 +608,58 @@ def read_render_pose_from_npy(poses_path):
         out_poses.append(update_camera)
     return out_poses
 
+def cam_vis(H, W, focal_x, focal_y, c2w):
 
+    grid = torch.tensor([[[0, 0],[H-1, 0]],
+         [[0, W-1],[H-1, W-1]]], dtype=torch.float)
+    i, j = grid.unbind(-1)
+    # the direction here is without +0.5 pixel centering as calibration is not so accurate
+    # see https://github.com/bmild/nerf/issues/24
+    directions = \
+        torch.stack([(i-W/2)/focal_x, -(j-H/2)/focal_y, -torch.ones_like(i)], -1) # (H, W, 3)
 
+    # Rotate ray directions from camera coordinate to the world coordinate
+    rays_d = directions @ c2w[:, :3].T # (H, W, 3)
+    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    # The origin of all rays is the camera origin in world coordinate
+    rays_o = c2w[None, :, 3] # (1, 3)
+
+    rays_d = rays_d.view(-1, 3)
+    # 定义五面体表示
+    cam_vis_3d = torch.vstack([rays_o, rays_d])
+    return cam_vis_3d
+
+import math
+
+def fov2focal(fov, pixels):
+    return pixels / (2 * math.tan(fov / 2))
+
+def cam_vis(camera):
+
+    H, W = camera.image_height, \
+           camera.image_width
+
+    focal_x, focal_y = fov2focal(camera.FoVx , W), \
+                       fov2focal(camera.FoVy , H)
+    # c2w = torch.inverse(camera.world_view_transform.T)
+
+    grid = torch.tensor([[[0, 0],[W-1, 0]],
+         [[0, H-1],[W-1, H-1]]], dtype=torch.float)
+    i, j = grid.unbind(-1)
+    # the direction here is without +0.5 pixel centering as calibration is not so accurate
+    # see https://github.com/bmild/nerf/issues/24
+    directions = \
+        torch.stack([(i-W/2)/focal_x, -(j-H/2)/focal_y, -torch.ones_like(i)], -1).to(camera.world_view_transform.device) # (H, W, 3)
+
+    # Rotate ray directions from camera coordinate to the world coordinate
+    rays_d = directions @ camera.world_view_transform.T[:3, :3] # (H, W, 3)
+    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    # The origin of all rays is the camera origin in world coordinate
+    rays_o = camera.camera_center
+    rays_d = rays_d.view(-1, 3)
+    rays_d = rays_o - rays_d * 0.15
+
+    # 定义五面体表示
+    cam_vis_3d = torch.vstack([rays_o, rays_d])
+
+    return cam_vis_3d

@@ -8,11 +8,12 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
-from scene.cameras import Camera
+import torch
+from scene.cameras import Camera, MiniCam
 import numpy as np
 from utils.general_utils import PILtoTorch
-from utils.graphics_utils import fov2focal
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
+from tqdm import tqdm
 
 WARNED = False
 
@@ -57,11 +58,44 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device, gt_depth=gt_depth)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
-    camera_list = []
+def loadCam_low_memory(args, cam_info, resolution_scale):
+    orig_w, orig_h = cam_info.image.size
 
-    for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+    if args.resolution in [1, 2, 4, 8]:
+        width, height = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    else:  # should be a type that converts to float
+        if args.resolution == -1:
+            if orig_w > 1600:
+                global WARNED
+                if not WARNED:
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        width, height = (int(orig_w / scale), int(orig_h / scale))
+    zfar = 100.0
+    znear = 0.01
+    world_view_transform = torch.tensor(getWorld2View2(cam_info.R, cam_info.T)).transpose(0, 1).cuda()
+    projection_matrix = getProjectionMatrix(znear=znear, zfar=zfar, fovX=cam_info.FovX,
+                                                 fovY=cam_info.FovY).transpose(0, 1).cuda()
+    full_proj_transform = (world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))).squeeze(0)
+
+
+    return MiniCam(width, height, cam_info.FovY, cam_info.FovX, znear, zfar, world_view_transform, full_proj_transform)
+
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, low_memory=False):
+    camera_list = []
+    for id, c in tqdm(enumerate(cam_infos), desc="load Cam"):
+        if low_memory:
+            camera_list.append(loadCam_low_memory(args, c, resolution_scale))
+        else:
+            camera_list.append(loadCam(args, id, c, resolution_scale))
 
     return camera_list
 

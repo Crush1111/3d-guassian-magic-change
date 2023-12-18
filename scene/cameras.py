@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -58,6 +58,16 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
+        focal_length_x = fov2focal(self.FoVx, self.image_width)
+        focal_length_y = fov2focal(self.FoVy, self.image_height)
+
+        self.K = torch.tensor([
+            [focal_length_x, 0, self.image_width / 2],
+            [0, focal_length_y, self.image_height / 2],
+            [0, 0, 1]
+        ]).cuda()
+
+
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width
@@ -71,3 +81,10 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
 
+        focal_length_x = fov2focal(self.FoVx, self.image_width)
+        focal_length_y = fov2focal(self.FoVy, self.image_height)
+        self.K = torch.tensor([
+            [focal_length_x, 0, self.image_width / 2],
+            [0, focal_length_y, self.image_height / 2],
+            [0, 0, 1]
+        ]).cuda()

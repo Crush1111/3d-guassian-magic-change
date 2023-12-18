@@ -177,13 +177,13 @@ def run(input_path, output_path, model_path, model_type="dpt_hybrid", optimize=T
         filename = os.path.join(
             output_path, os.path.splitext(os.path.basename(img_name))[0]
         )
-        util.io.write_depth(filename, prediction, bits=1, absolute_depth=args.absolute_depth)
+        util.io.write_depth(filename, prediction, bits=2, absolute_depth=args.absolute_depth)
 
     print("finished")
 
 
 if __name__ == "__main__":
-    PATH = "/home/guozebin/work_code/3d_gaussian_magic_change/data/360_v2/bicycle"
+    PATH = "/home/guozebin/work_code/3d_gaussian_magic_change/data/hall_1010"
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
